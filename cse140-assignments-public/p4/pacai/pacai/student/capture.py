@@ -11,6 +11,7 @@ TEAM_MEMORY: dict[str, int] = {
 }
 
 _RESPAWN_WINDOW_LENGTH = 10
+_MAX_CELLS_FOR_PRECOMPUTE = 700
 
 
 def create_team() -> list[pacai.core.agentinfo.AgentInfo]:
@@ -31,9 +32,12 @@ class BaseCaptureAgent(pacai.core.agent.Agent):
         self._team_modifier: int = 0
 
     def game_start(self, initial_state) -> None:
-        if self._distance_pre is None:
+        board = initial_state.board
+        height = board.height
+        width = board.width
+        if (self._distance_pre is None) and (height * width <= _MAX_CELLS_FOR_PRECOMPUTE):
             self._distance_pre = pacai.search.distance.DistancePreComputer()
-            self._distance_pre.compute(initial_state.board)
+            self._distance_pre.compute(board)
         self._team_modifier = -1 if (self.agent_index % 2 == 0) else 1
         super().game_start(initial_state)
 
@@ -178,8 +182,8 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
     _SCORE_WEIGHT = 6.0
     _INVADER_COUNT_WEIGHT = 120.0
     _INVADER_DIST_WEIGHT = 7.0
-    _HOME_FOOD_DIST_WEIGHT = 0.6
-    _PATROL_DIST_WEIGHT = 1.0
+    _HOME_FOOD_DIST_WEIGHT = 0.3
+    _PATROL_DIST_WEIGHT = 1.2
     _STOP_PENALTY = 6.0
     _CROSS_PENALTY = 22.0
     _STEP_PENALTY = 0.1
@@ -194,17 +198,19 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
         if not home_food:
             self._patrol_target = None
             return
-        rows = [p.row for p in home_food]
-        cols = [p.col for p in home_food]
-        avg_r = sum(rows) / float(len(rows))
-        avg_c = sum(cols) / float(len(cols))
-
-        def sq_dist(p):
-            dr = p.row - avg_r
-            dc = p.col - avg_c
-            return dr * dr + dc * dc
-
-        self._patrol_target = min(home_food, key=sq_dist)
+        board = state.board
+        height = board.height
+        center_row = height // 2
+        if self._team_modifier == -1:
+            extreme_col = max(p.col for p in home_food)
+            candidates = [p for p in home_food if p.col == extreme_col]
+        else:
+            extreme_col = min(p.col for p in home_food)
+            candidates = [p for p in home_food if p.col == extreme_col]
+        self._patrol_target = min(
+            candidates,
+            key=lambda p: abs(p.row - center_row),
+        )
 
     def get_action(
         self,
