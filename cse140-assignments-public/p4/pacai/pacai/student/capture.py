@@ -1,5 +1,4 @@
 import typing
-
 import pacai.core.action
 import pacai.core.agent
 import pacai.core.agentinfo
@@ -11,7 +10,8 @@ TEAM_MEMORY: dict[str, int] = {
 }
 
 _RESPAWN_WINDOW_LENGTH = 10
-_MAX_CELLS_FOR_PRECOMPUTE = 700
+
+_DISTANCE_CACHE: dict[str, pacai.search.distance.DistancePreComputer] = {}
 
 
 def create_team() -> list[pacai.core.agentinfo.AgentInfo]:
@@ -32,13 +32,20 @@ class BaseCaptureAgent(pacai.core.agent.Agent):
         self._team_modifier: int = 0
 
     def game_start(self, initial_state) -> None:
+        TEAM_MEMORY["respawn_window_timer"] = 0
         board = initial_state.board
-        height = board.height
-        width = board.width
-        if (self._distance_pre is None) and (height * width <= _MAX_CELLS_FOR_PRECOMPUTE):
-            self._distance_pre = pacai.search.distance.DistancePreComputer()
-            self._distance_pre.compute(board)
+        board_key = board.get_nonwall_string()
+
+        if board_key in _DISTANCE_CACHE:
+            self._distance_pre = _DISTANCE_CACHE[board_key]
+        else:
+            pre = pacai.search.distance.DistancePreComputer()
+            pre.compute(board)
+            _DISTANCE_CACHE[board_key] = pre
+            self._distance_pre = pre
+
         self._team_modifier = -1 if (self.agent_index % 2 == 0) else 1
+
         super().game_start(initial_state)
 
     def _maze_distance(self, a, b, default: float = 9999.0) -> float:
@@ -53,30 +60,47 @@ class BaseCaptureAgent(pacai.core.agent.Agent):
         legal_actions = state.get_legal_actions()
         if not legal_actions:
             return pacai.core.action.STOP
+
+        before_inv = state.get_invader_positions(self.agent_index)
+
+        successors: list[pacai.capture.gamestate.GameState] = []
         values: list[float] = []
+
         for action in legal_actions:
-            values.append(self.evaluate(state, action))
+            succ = state.generate_successor(action)
+            successors.append(succ)
+            values.append(self._evaluate_successor(state, succ, action))
+
         best_value = max(values)
-        candidate_actions: list[pacai.core.action.Action] = []
-        for action, value in zip(legal_actions, values):
-            if value == best_value:
-                candidate_actions.append(action)
-        chosen = self.rng.choice(candidate_actions)
+        best_indexes = [i for i, v in enumerate(values) if v == best_value]
+        chosen_index = self.rng.choice(best_indexes)
+        chosen_action = legal_actions[chosen_index]
+        chosen_succ = successors[chosen_index]
+
         if TEAM_MEMORY["respawn_window_timer"] > 0:
             TEAM_MEMORY["respawn_window_timer"] -= 1
-        succ = state.generate_successor(chosen)
-        before_inv = state.get_invader_positions(self.agent_index)
-        after_inv = succ.get_invader_positions(self.agent_index)
+
+        after_inv = chosen_succ.get_invader_positions(self.agent_index)
         if len(after_inv) < len(before_inv):
             TEAM_MEMORY["respawn_window_timer"] = max(
                 TEAM_MEMORY["respawn_window_timer"],
                 _RESPAWN_WINDOW_LENGTH,
             )
-        return chosen
+
+        return chosen_action
 
     def evaluate(
         self,
         state: pacai.capture.gamestate.GameState,
+        action: pacai.core.action.Action,
+    ) -> float:
+        successor: pacai.capture.gamestate.GameState = state.generate_successor(action)
+        return self._evaluate_successor(state, successor, action)
+
+    def _evaluate_successor(
+        self,
+        state: pacai.capture.gamestate.GameState,
+        successor: pacai.capture.gamestate.GameState,
         action: pacai.core.action.Action,
     ) -> float:
         raise NotImplementedError
@@ -95,25 +119,42 @@ class OffensiveCaptureAgent(BaseCaptureAgent):
     _STEP_PENALTY = 0.1
     _REVERSE_PENALTY = 2.0
 
-    def evaluate(self, state, action):
-        successor: pacai.capture.gamestate.GameState = state.generate_successor(action)
+    def _evaluate_successor(self, state, successor, action):
         my_pos = successor.get_agent_position(self.agent_index)
         if my_pos is None:
             return -1e6
+
         score = successor.get_normalized_score(self.agent_index)
+
         food_positions = successor.get_food(agent_index=self.agent_index)
         if food_positions:
             min_food_dist = min(
                 self._maze_distance(my_pos, fp, default=9999.0)
                 for fp in food_positions
             )
+            
+            K = 10
+            manhattan_food = sorted(
+                food_positions,
+                key=lambda fp: pacai.search.distance.manhattan_distance(my_pos, fp)
+            )
+            candidates = manhattan_food[:K]
+            min_food_dist = min(
+                self._maze_distance(my_pos, fp, default=9999.0)
+                for fp in candidates
+            )
+
+            next_food_left = len(food_positions)
         else:
             min_food_dist = 0.0
+            next_food_left = 0
+
         cur_food_left = state.food_count(agent_index=self.agent_index)
-        next_food_left = successor.food_count(agent_index=self.agent_index)
         food_eaten = max(0, cur_food_left - next_food_left)
+
         is_pacman = successor.is_pacman(self.agent_index)
         is_scared = successor.is_scared(self.agent_index)
+
         nonscared_opponents = successor.get_nonscared_opponent_positions(
             self.agent_index
         )
@@ -121,19 +162,23 @@ class OffensiveCaptureAgent(BaseCaptureAgent):
             self.agent_index
         )
         invaders = successor.get_invader_positions(self.agent_index)
+
         respawn_window = TEAM_MEMORY.get("respawn_window_timer", 0) > 0
+
         min_ghost_dist = 9999.0
         if is_pacman and nonscared_opponents:
             min_ghost_dist = min(
                 self._maze_distance(my_pos, pos, default=9999.0)
                 for pos in nonscared_opponents.values()
             )
+
         danger_penalty = 0.0
         if is_pacman and (not is_scared) and (min_ghost_dist < self._DANGER_RADIUS):
             ghost_weight = self._GHOST_DANGER_WEIGHT
             if respawn_window:
                 ghost_weight *= 0.4
             danger_penalty = (self._DANGER_RADIUS - min_ghost_dist) * ghost_weight
+
         scared_bonus = 0.0
         if is_pacman and scared_opponents:
             min_scared = min(
@@ -141,6 +186,7 @@ class OffensiveCaptureAgent(BaseCaptureAgent):
                 for pos in scared_opponents.values()
             )
             scared_bonus = 1.0 / (1.0 + float(min_scared))
+
         off_defense_penalty = 0.0
         num_invaders = len(invaders)
         if (not is_pacman) and num_invaders > 0:
@@ -153,13 +199,16 @@ class OffensiveCaptureAgent(BaseCaptureAgent):
                 self._OFF_INVADER_COUNT_WEIGHT * float(num_invaders)
                 + self._OFF_INVADER_DIST_WEIGHT * float(invader_min_dist)
             )
+
         stop_penalty = self._STOP_PENALTY if action == pacai.core.action.STOP else 0.0
+
         last_action = state.get_last_agent_action(self.agent_index)
         reverse_penalty = 0.0
         if last_action is not None:
             rev = pacai.core.action.get_reverse_direction(last_action)
             if rev is not None and action == rev:
                 reverse_penalty = self._REVERSE_PENALTY
+
         value = 0.0
         value += self._SCORE_WEIGHT * score
         value -= self._FOOD_DIST_WEIGHT * float(min_food_dist)
@@ -168,13 +217,17 @@ class OffensiveCaptureAgent(BaseCaptureAgent):
         value -= stop_penalty
         value -= reverse_penalty
         value -= self._STEP_PENALTY
+
         if is_pacman:
             value += self._PACMAN_BONUS
             if respawn_window:
                 value += 3.0
+
         if food_eaten > 0:
             value += self._FOOD_EATEN_WEIGHT * float(food_eaten)
+
         value += scared_bonus
+
         return value
 
 
@@ -185,7 +238,7 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
     _HOME_FOOD_DIST_WEIGHT = 0.3
     _PATROL_DIST_WEIGHT = 1.2
     _STOP_PENALTY = 6.0
-    _CROSS_PENALTY = 22.0
+    _CROSS_PENALTY = 12.0
     _STEP_PENALTY = 0.1
     _REVERSE_PENALTY = 2.0
 
@@ -198,15 +251,18 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
         if not home_food:
             self._patrol_target = None
             return
+
         board = state.board
         height = board.height
         center_row = height // 2
+
         if self._team_modifier == -1:
             extreme_col = max(p.col for p in home_food)
             candidates = [p for p in home_food if p.col == extreme_col]
         else:
             extreme_col = min(p.col for p in home_food)
             candidates = [p for p in home_food if p.col == extreme_col]
+
         self._patrol_target = min(
             candidates,
             key=lambda p: abs(p.row - center_row),
@@ -219,14 +275,16 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
         self._update_patrol_target(state)
         return super().get_action(state)
 
-    def evaluate(self, state, action):
-        successor: pacai.capture.gamestate.GameState = state.generate_successor(action)
+    def _evaluate_successor(self, state, successor, action):
         my_pos = successor.get_agent_position(self.agent_index)
         if my_pos is None:
             return -1e6
+
         score = successor.get_normalized_score(self.agent_index)
+
         invaders = successor.get_invader_positions(self.agent_index)
         num_invaders = len(invaders)
+
         if num_invaders > 0:
             min_invader_dist = min(
                 self._maze_distance(my_pos, pos, default=9999.0)
@@ -234,8 +292,10 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
             )
         else:
             min_invader_dist = 0.0
+
         is_pacman = successor.is_pacman(self.agent_index)
         is_scared = successor.is_scared(self.agent_index)
+
         home_food_positions = successor.get_food(
             team_modifier=-self._team_modifier
         )
@@ -244,14 +304,25 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
                 self._maze_distance(my_pos, fp, default=9999.0)
                 for fp in home_food_positions
             )
+            home_food_left = len(home_food_positions)
         else:
             home_food_min_dist = 0.0
+            home_food_left = 0
+
         stop_penalty = self._STOP_PENALTY if action == pacai.core.action.STOP else 0.0
+
         cross_penalty = 0.0
         if is_pacman and num_invaders == 0:
-            cross_penalty = self._CROSS_PENALTY
+            if home_food_left > 5:
+                cross_penalty = self._CROSS_PENALTY
+            elif home_food_left > 0:
+                cross_penalty = 0.5 * self._CROSS_PENALTY
+            else:
+                cross_penalty = 0.0
+
         value = 0.0
         value += self._SCORE_WEIGHT * score
+
         if num_invaders > 0:
             dist_weight = self._INVADER_DIST_WEIGHT * (0.5 if is_scared else 1.0)
             value -= self._INVADER_COUNT_WEIGHT * float(num_invaders)
@@ -261,6 +332,7 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
         else:
             if not is_pacman:
                 value -= self._HOME_FOOD_DIST_WEIGHT * float(home_food_min_dist)
+
             if (not is_pacman) and (self._patrol_target is not None):
                 patrol_dist = self._maze_distance(
                     my_pos,
@@ -268,14 +340,17 @@ class DefensiveCaptureAgent(BaseCaptureAgent):
                     default=9999.0,
                 )
                 value -= self._PATROL_DIST_WEIGHT * float(patrol_dist)
+
         last_action = state.get_last_agent_action(self.agent_index)
         reverse_penalty = 0.0
         if last_action is not None:
             rev = pacai.core.action.get_reverse_direction(last_action)
             if rev is not None and action == rev:
                 reverse_penalty = self._REVERSE_PENALTY
+
         value -= stop_penalty
         value -= cross_penalty
         value -= reverse_penalty
         value -= self._STEP_PENALTY
+
         return value
